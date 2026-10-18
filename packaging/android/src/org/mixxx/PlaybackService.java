@@ -15,7 +15,9 @@ import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Log;
 
@@ -43,6 +45,11 @@ public class PlaybackService extends Service {
     private static final String TAG = "DJSugarPlayback";
     private static final String CHANNEL_ID = "djsugar_playback";
     private static final int NOTIFICATION_ID = 1;
+    // The wake lock is acquired with a timeout as a safety net against
+    // battery drain if the service is ever orphaned, and renewed before it
+    // expires for as long as the service holds it.
+    private static final long WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
+    private static final long WAKE_LOCK_RENEW_MS = 9 * 60 * 1000L;
 
     public static final String ACTION_START =
         "org.mixxx.action.START_PLAYBACK_SERVICE";
@@ -50,6 +57,17 @@ public class PlaybackService extends Service {
         "org.mixxx.action.STOP_PLAYBACK_SERVICE";
 
     private PowerManager.WakeLock mWakeLock;
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mRenewWakeLock = new Runnable() {
+        @Override
+        public void run() {
+            if (mWakeLock != null && mWakeLock.isHeld()) {
+                // Re-acquiring a non-reference-counted lock resets its timeout.
+                mWakeLock.acquire(WAKE_LOCK_TIMEOUT_MS);
+                mHandler.postDelayed(this, WAKE_LOCK_RENEW_MS);
+            }
+        }
+    };
     private AudioManager mAudioManager;
     private AudioFocusRequest mFocusRequest;
     private final AudioManager.OnAudioFocusChangeListener mFocusListener =
@@ -84,20 +102,30 @@ public class PlaybackService extends Service {
             }
         };
 
+    /**
+     * Starts (or re-asserts) the service. Call only while the activity is in
+     * the foreground: on Android 12+ starting a foreground service from the
+     * background throws ForegroundServiceStartNotAllowedException (a subclass
+     * of IllegalStateException), and on 8+ startService from the background
+     * throws IllegalStateException. Either is caught and logged.
+     */
     public static void start(Context context) {
         Intent intent = new Intent(context, PlaybackService.class);
         intent.setAction(ACTION_START);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent);
-        } else {
-            context.startService(intent);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        } catch (IllegalStateException e) {
+            Log.w(TAG, "Could not start playback service", e);
         }
     }
 
     public static void stop(Context context) {
-        Intent intent = new Intent(context, PlaybackService.class);
-        intent.setAction(ACTION_STOP);
-        context.startService(intent);
+        // stopService is not subject to background-start restrictions.
+        context.stopService(new Intent(context, PlaybackService.class));
     }
 
     @Override
@@ -138,12 +166,18 @@ public class PlaybackService extends Service {
 
     private void startInForeground() {
         Notification notification = buildNotification();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification,
-                android.content.pm.ServiceInfo
-                    .FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-        } else {
-            startForeground(NOTIFICATION_ID, notification);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification,
+                    android.content.pm.ServiceInfo
+                        .FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+            } else {
+                startForeground(NOTIFICATION_ID, notification);
+            }
+        } catch (IllegalStateException e) {
+            // ForegroundServiceStartNotAllowedException (Android 12+), e.g.
+            // focus regained while the app is in the background.
+            Log.w(TAG, "Could not enter foreground", e);
         }
     }
 
@@ -189,12 +223,14 @@ public class PlaybackService extends Service {
         }
         mWakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK, TAG + ":lock");
-        // 10-minute timeout as a safety net against battery drain if the
-        // service is ever orphaned; normal path releases explicitly.
-        mWakeLock.acquire(10 * 60 * 1000L);
+        mWakeLock.setReferenceCounted(false);
+        mWakeLock.acquire(WAKE_LOCK_TIMEOUT_MS);
+        mHandler.removeCallbacks(mRenewWakeLock);
+        mHandler.postDelayed(mRenewWakeLock, WAKE_LOCK_RENEW_MS);
     }
 
     private void releaseWakeLock() {
+        mHandler.removeCallbacks(mRenewWakeLock);
         if (mWakeLock != null && mWakeLock.isHeld()) {
             mWakeLock.release();
         }

@@ -160,21 +160,11 @@ public class MainActivity extends QtActivityBase {
     protected void onResume() {
         super.onResume();
         requestAllFilesAccessIfNeeded();
-    }
-
-    // ─── Background audio survival (AI-agent change, needs human review) ──
-    // The mix engine must NOT pause here: backgrounding the app is exactly
-    // the case PlaybackService protects. Re-assert the service so a system
-    // restart of our process re-establishes foreground priority.
-    @Override
-    protected void onPause() {
-        super.onPause();
-        PlaybackService.start(this);
-    }
-
-    @Override
-    protected void onStop() {
-        super.onStop();
+        // ─── Background audio survival (AI-agent change, needs human review)
+        // Re-assert the service while we are in the foreground (e.g. after it
+        // relinquished foreground state on audio-focus loss). Do NOT start it
+        // from onPause/onStop: on Android 12+ a foreground-service start from
+        // the background throws ForegroundServiceStartNotAllowedException.
         PlaybackService.start(this);
     }
 
